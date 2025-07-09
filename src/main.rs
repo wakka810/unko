@@ -95,7 +95,7 @@ fn run_external(argv: &[String]) {
                 Some(2) => eprintln!("知らねーよ、そんなの"),
                 Some(13) => eprintln!("駄目です（権限なし）"),
                 Some(code) => eprintln!("これもうわかんねぇな… {code}: {e}"),
-                None => eprintln!("よくわかんなかったです(OSエラーコード): {e}"),
+                None => eprintln!("よくわかんなかったです(OSエラー): {e}"),
             }
         }
     }
