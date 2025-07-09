@@ -1,7 +1,5 @@
 /target
-target/
-.DS_Storedebug
-target
-**/mutants.out*/
-*.pdb
+.DS_Store
 **/*.rs.bk
+*.pdb
+**/mutants.out*/
