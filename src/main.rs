@@ -11,6 +11,7 @@ use std::{
 use ansi_term::Colour::{Blue, Fixed, Green, Purple, Red, Yellow};
 use git2::Repository;
 use once_cell::sync::Lazy;
+use rayon::prelude::*;
 use rustyline::{
     completion::{Completer, FilenameCompleter, Pair},
     config::{Builder as ConfigBuilder, CompletionType, Config, EditMode},
@@ -23,24 +24,26 @@ use rustyline::{
 };
 
 static BIN_CACHE: Lazy<Vec<String>> = Lazy::new(|| {
-    let mut bins = HashSet::new();
-    if let Some(path_var) = env::var_os("PATH") {
-        for dir in env::split_paths(&path_var) {
-            if let Ok(entries) = fs::read_dir(&dir) {
-                for e in entries.filter_map(Result::ok) {
-                    let p = e.path();
-                    if p.is_file() && is_executable(&p) {
-                        if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-                            bins.insert(name.to_string());
-                        }
-                    }
-                }
-            }
-        }
-    }
-    let mut v: Vec<_> = bins.into_iter().collect();
-    v.sort();
-    v
+    let mut bins = if let Some(path_var) = env::var_os("PATH") {
+        env::split_paths(&path_var)
+            .par_bridge()
+            .map(|dir| {
+                fs::read_dir(dir)
+                    .map(|entries| entries.filter_map(Result::ok).collect::<Vec<_>>())
+                    .unwrap_or_default()
+            })
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_file() && is_executable(p))
+            .filter_map(|p| p.file_name().and_then(|n| n.to_str().map(String::from)))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    bins.sort();
+    bins
 });
 
 struct ShellHelper {
