@@ -24,13 +24,13 @@ cargo run
 ## インストール
 
 ```bash
-./install.sh
+curl -sSL https://raw.githubusercontent.com/wakka810/unko/day2/install.sh | bash
 ```
 
 ## アンインストール
 
 ```bash
-./uninstall.sh
+curl -sSL https://raw.githubusercontent.com/wakka810/unko/day2/uninstall.sh | bash
 ```
 
 ## ビルド
