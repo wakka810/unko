@@ -21,6 +21,18 @@ Rustで書かれたシンプルなUNIX風シェルです。
 cargo run
 ```
 
+## インストール
+
+```bash
+./install.sh
+```
+
+## アンインストール
+
+```bash
+./uninstall.sh
+```
+
 ## ビルド
 
 ```
