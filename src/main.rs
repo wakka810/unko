@@ -11,7 +11,6 @@ use std::{
 use ansi_term::Colour::{Blue, Fixed, Green, Purple, Red, Yellow};
 use git2::Repository;
 use once_cell::sync::Lazy;
-use regex::Regex;
 use rustyline::{
     completion::{Completer, FilenameCompleter, Pair},
     config::{Builder as ConfigBuilder, CompletionType, Config, EditMode},
@@ -206,8 +205,21 @@ impl Validator for ShellHelper {
 }
 
 fn build_prompt(last_status: i32) -> String {
+    let user = env::var("USER").unwrap_or_default();
     let cwd = env::current_dir().unwrap_or_default();
-    let path_display = cwd.display();
+    let path_display = if let Some(home) = dirs::home_dir() {
+        if let Ok(p) = cwd.strip_prefix(&home) {
+            if p.as_os_str().is_empty() {
+                "~".to_string()
+            } else {
+                format!("~/{}", p.display())
+            }
+        } else {
+            cwd.display().to_string()
+        }
+    } else {
+        cwd.display().to_string()
+    };
     let branch = Repository::discover(&cwd)
         .ok()
         .and_then(|repo| {
@@ -222,8 +234,9 @@ fn build_prompt(last_status: i32) -> String {
         format!(" {}", Purple.paint(format!("({})", branch)))
     };
     format!(
-        "{}{}{} ",
-        Blue.paint(path_display.to_string()),
+        "{}:{}{}{} ",
+        Green.paint(user),
+        Blue.paint(path_display),
         git_str,
         Blue.paint(">"),
         // status_str
