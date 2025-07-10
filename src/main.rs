@@ -479,15 +479,15 @@ fn main() -> rustyline::Result<()> {
                 match parse_line(trimmed) {
                     Ok(argv) if argv.is_empty() => continue,
                     Ok(argv) => {
-                        if try_builtin(&argv) {
-                            last_status = 0;
-                            continue;
-                        }
                         let mut argv_exec = argv.clone();
                         if let Some(p) = resolve_command_path(&argv_exec[0]) {
                             argv_exec[0] = p;
+                            last_status = run_external(&argv_exec);
+                        } else if try_builtin(&argv) {
+                            last_status = 0;
+                        } else {
+                            last_status = run_external(&argv_exec);
                         }
-                        last_status = run_external(&argv_exec);
                     }
                     Err(e) => eprintln!("{e}"),
                 }
