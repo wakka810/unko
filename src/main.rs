@@ -63,6 +63,17 @@ impl Completer for ShellHelper {
         ctx: &Context<'_>,
     ) -> rustyline::Result<(usize, Vec<Pair>)> {
         let (start, word) = extract_current_token(line, pos);
+        
+        if word.is_empty() {
+            let mut out = Vec::new();
+            for &b in ["echo", "ls", "cd", "pwd", "exit", "quit"].iter() {
+                out.push(Pair {
+                    display: b.into(),
+                    replacement: b.into(),
+                });
+            }
+            return Ok((start, out));
+        }
 
         if !is_first_token(line, pos) {
             return self.completer.complete(line, pos, ctx);
