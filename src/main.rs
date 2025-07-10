@@ -30,6 +30,27 @@ static FLAG_RE: Lazy<Regex> =
 static SUB_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"^\s{2,}([A-Za-z0-9][A-Za-z0-9_-]+)\s").unwrap());
 
+static BIN_CACHE: Lazy<Vec<String>> = Lazy::new(|| {
+    let mut bins = HashSet::new();
+    if let Some(path_var) = env::var_os("PATH") {
+        for dir in env::split_paths(&path_var) {
+            if let Ok(entries) = fs::read_dir(&dir) {
+                for e in entries.filter_map(Result::ok) {
+                    let p = e.path();
+                    if p.is_file() && is_executable(&p) {
+                        if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                            bins.insert(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut v: Vec<_> = bins.into_iter().collect();
+    v.sort();
+    v
+});
+
 struct ShellHelper {
     completer: FilenameCompleter,
     highlighter: MatchingBracketHighlighter,
@@ -50,58 +71,44 @@ impl Completer for ShellHelper {
     ) -> rustyline::Result<(usize, Vec<Pair>)> {
         let (start, word) = extract_current_token(line, pos);
 
-        if is_first_token(line, pos) {
-            let mut cand = Vec::new();
-            let mut seen = HashSet::new();
+        if word.contains('/') || word.starts_with('.') {
+            return self.completer.complete(line, pos, ctx);
+        }
 
+        if is_first_token(line, pos) {
+            let mut out = Vec::new();
             for &b in ["echo", "ls", "cd", "pwd", "exit", "quit"].iter() {
-                if b.starts_with(word) && seen.insert(b.into()) {
-                    cand.push(Pair {
+                if b.starts_with(word) {
+                    out.push(Pair {
                         display: b.into(),
                         replacement: b.into(),
                     });
                 }
             }
-            if let Some(path_var) = env::var_os("PATH") {
-                for dir in env::split_paths(&path_var) {
-                    if let Ok(entries) = fs::read_dir(&dir) {
-                        for e in entries.filter_map(Result::ok) {
-                            let fname = e.file_name().to_string_lossy().into_owned();
-                            if !fname.starts_with(word) || !is_executable(&e.path()) {
-                                continue;
-                            }
-                            if seen.insert(fname.clone()) {
-                                cand.push(Pair {
-                                    display: fname.clone(),
-                                    replacement: fname,
-                                });
-                            }
-                        }
-                    }
+            for bin in BIN_CACHE.iter() {
+                if bin.starts_with(word) {
+                    out.push(Pair {
+                        display: bin.clone(),
+                        replacement: bin.clone(),
+                    });
                 }
             }
-            return Ok((start, cand));
+            return Ok((start, out));
         }
 
         let tokens: Vec<&str> = line[..pos].split_whitespace().collect();
-        if tokens.is_empty() {
-            return self.completer.complete(line, pos, ctx);
-        }
-        let cmd = tokens[0];
+        let cmd = tokens.get(0).copied().unwrap_or("");
         let subcmd = tokens.get(1).copied();
 
-        let mut cand = Vec::new();
-        for a in fetch_args(cmd, subcmd) {
-            if a.starts_with(word) {
-                cand.push(Pair {
-                    display: a.clone(),
-                    replacement: a,
-                });
-            }
-        }
+        let mut cand = fetch_args(cmd, subcmd)
+            .into_iter()
+            .filter(|a| a.starts_with(word))
+            .map(|a| Pair { display: a.clone(), replacement: a })
+            .collect::<Vec<_>>();
 
         let (f_start, mut f_cand) = self.completer.complete(line, pos, ctx)?;
         cand.extend(f_cand);
+
         Ok((start.min(f_start), cand))
     }
 }
