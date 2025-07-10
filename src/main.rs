@@ -23,13 +23,6 @@ use rustyline::{
     Context, Editor, Helper,
 };
 
-static ARG_CACHE: Lazy<Mutex<HashMap<String, Vec<String>>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
-static FLAG_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"-{1,2}[A-Za-z0-9][A-Za-z0-9_-]*").unwrap());
-static SUB_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"^\s{2,}([A-Za-z0-9][A-Za-z0-9_-]+)\s").unwrap());
-
 static BIN_CACHE: Lazy<Vec<String>> = Lazy::new(|| {
     let mut bins = HashSet::new();
     if let Some(path_var) = env::var_os("PATH") {
@@ -71,98 +64,34 @@ impl Completer for ShellHelper {
     ) -> rustyline::Result<(usize, Vec<Pair>)> {
         let (start, word) = extract_current_token(line, pos);
 
+        if !is_first_token(line, pos) {
+            return self.completer.complete(line, pos, ctx);
+        }
+
         if word.contains('/') || word.starts_with('.') {
             return self.completer.complete(line, pos, ctx);
         }
 
-        if is_first_token(line, pos) {
-            let mut out = Vec::new();
-            for &b in ["echo", "ls", "cd", "pwd", "exit", "quit"].iter() {
-                if b.starts_with(word) {
-                    out.push(Pair {
-                        display: b.into(),
-                        replacement: b.into(),
-                    });
-                }
+        let mut out = Vec::new();
+        for &b in ["echo", "ls", "cd", "pwd", "exit", "quit"].iter() {
+            if b.starts_with(word) {
+                out.push(Pair {
+                    display: b.into(),
+                    replacement: b.into(),
+                });
             }
-            for bin in BIN_CACHE.iter() {
-                if bin.starts_with(word) {
-                    out.push(Pair {
-                        display: bin.clone(),
-                        replacement: bin.clone(),
-                    });
-                }
+        }
+        for bin in BIN_CACHE.iter() {
+            if bin.starts_with(word) {
+                out.push(Pair {
+                    display: bin.clone(),
+                    replacement: bin.clone(),
+                });
             }
-            return Ok((start, out));
         }
 
-        let tokens: Vec<&str> = line[..pos].split_whitespace().collect();
-        let cmd = tokens.get(0).copied().unwrap_or("");
-        let subcmd = tokens.get(1).copied();
-
-        let mut cand = fetch_args(cmd, subcmd)
-            .into_iter()
-            .filter(|a| a.starts_with(word))
-            .map(|a| Pair { display: a.clone(), replacement: a })
-            .collect::<Vec<_>>();
-
-        let (f_start, mut f_cand) = self.completer.complete(line, pos, ctx)?;
-        cand.extend(f_cand);
-
-        Ok((start.min(f_start), cand))
+        Ok((start, out))
     }
-}
-
-fn fetch_args(cmd: &str, subcmd: Option<&str>) -> Vec<String> {
-    let key = subcmd.map_or_else(|| cmd.to_string(), |s| format!("{cmd} {s}"));
-
-    if let Some(c) = ARG_CACHE.lock().unwrap().get(&key) {
-        return c.clone();
-    }
-
-    let mut out = Vec::new();
-
-    if subcmd.is_none() {
-        out.extend(parse_subcommands(cmd));
-    }
-
-    out.extend(parse_flags(cmd, subcmd));
-
-    out.sort();
-    out.dedup();
-    ARG_CACHE.lock().unwrap().insert(key, out.clone());
-    out
-}
-
-fn parse_subcommands(cmd: &str) -> Vec<String> {
-    Command::new(cmd)
-        .arg("--help")
-        .output()
-        .ok()
-        .map(|out| {
-            SUB_RE
-                .captures_iter(&String::from_utf8_lossy(&out.stdout))
-                .filter_map(|cap| cap.get(1).map(|m| m.as_str().to_string()))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn parse_flags(cmd: &str, subcmd: Option<&str>) -> Vec<String> {
-    let mut c = Command::new(cmd);
-    if let Some(sc) = subcmd {
-        c.arg(sc);
-    }
-    c.arg("--help")
-        .output()
-        .ok()
-        .map(|out| {
-            FLAG_RE
-                .find_iter(&String::from_utf8_lossy(&out.stdout))
-                .map(|m| m.as_str().to_string())
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 fn is_first_token(line: &str, pos: usize) -> bool {
@@ -276,11 +205,6 @@ fn build_prompt(last_status: i32) -> String {
                 .and_then(|h| h.shorthand().map(|s| s.to_owned()))
         })
         .unwrap_or_default();
-    let status_str = if last_status == 0 {
-        Green.paint(format!("[{}]", last_status)).to_string()
-    } else {
-        Red.paint(format!("[{}]", last_status)).to_string()
-    };
     let git_str = if branch.is_empty() {
         String::new()
     } else {
