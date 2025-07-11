@@ -2,7 +2,8 @@ use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
     env,
-    fs,
+    fs::{self, File, OpenOptions},
+    os::unix::io::AsRawFd,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::Mutex,
@@ -22,6 +23,29 @@ use rustyline::{
     validate::{MatchingBracketValidator, Validator},
     Context, Editor, Helper,
 };
+
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
+use signal_hook::{
+    consts::{SIGCHLD, SIGINT},
+    iterator::Signals,
+};
+use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+use nix::sys::signal::{kill, Signal};
+use nix::unistd::Pid;
+
+static JOB_COUNTER: AtomicUsize = AtomicUsize::new(1);
+static JOBS: Lazy<Mutex<HashMap<usize, Job>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+#[derive(Debug , Clone)]
+struct Job {
+    id: usize,
+    pids: Vec<u32>,
+    cmd: String,
+}
+
 
 static BIN_CACHE: Lazy<Vec<String>> = Lazy::new(|| {
     let mut bins = if let Some(path_var) = env::var_os("PATH") {
@@ -46,6 +70,13 @@ static BIN_CACHE: Lazy<Vec<String>> = Lazy::new(|| {
     bins
 });
 
+struct ParsedCommand {
+    argv: Vec<String>,
+    stdin_path: Option<String>,
+    stdout_path: Option<String>,
+    stdout_append: bool,
+}
+
 struct ShellHelper {
     completer: FilenameCompleter,
     highlighter: MatchingBracketHighlighter,
@@ -65,45 +96,43 @@ impl Completer for ShellHelper {
         ctx: &Context<'_>,
     ) -> rustyline::Result<(usize, Vec<Pair>)> {
         let (start, word) = extract_current_token(line, pos);
-        
-        if word.is_empty() {
+
+        let mut is_command = true;
+        if start > 0 {
+            if let Some(prev_char) = line[..start].chars().rev().find(|c| !c.is_whitespace()) {
+                if !matches!(prev_char, '|' | ';' | '&' | '(') {
+                    is_command = false;
+                }
+            }
+        }
+
+        if is_command {
+            if word.contains('/') || word.starts_with('.') {
+                return self.completer.complete(line, pos, ctx);
+            }
+
             let mut out = Vec::new();
-            for &b in ["echo", "ls", "cd", "pwd", "exit", "quit"].iter() {
-                out.push(Pair {
-                    display: b.into(),
-                    replacement: b.into(),
-                });
+            let builtins = ["echo", "ls", "cd", "pwd", "exit", "quit", "jobs", "fg", "bg"];
+            for &b in builtins.iter() {
+                if b.starts_with(word) {
+                    out.push(Pair {
+                        display: b.into(),
+                        replacement: b.into(),
+                    });
+                }
             }
-            return Ok((start, out));
-        }
-
-        if !is_first_token(line, pos) {
-            return self.completer.complete(line, pos, ctx);
-        }
-
-        if word.contains('/') || word.starts_with('.') {
-            return self.completer.complete(line, pos, ctx);
-        }
-
-        let mut out = Vec::new();
-        for &b in ["echo", "ls", "cd", "pwd", "exit", "quit"].iter() {
-            if b.starts_with(word) {
-                out.push(Pair {
-                    display: b.into(),
-                    replacement: b.into(),
-                });
+            for bin in BIN_CACHE.iter() {
+                if bin.starts_with(word) {
+                    out.push(Pair {
+                        display: bin.clone(),
+                        replacement: bin.clone(),
+                    });
+                }
             }
+            Ok((start, out))
+        } else {
+            self.completer.complete(line, pos, ctx)
         }
-        for bin in BIN_CACHE.iter() {
-            if bin.starts_with(word) {
-                out.push(Pair {
-                    display: bin.clone(),
-                    replacement: bin.clone(),
-                });
-            }
-        }
-
-        Ok((start, out))
     }
 }
 
@@ -277,6 +306,17 @@ fn expand_var<I: Iterator<Item = char>>(iter: &mut std::iter::Peekable<I>) -> St
     }
 }
 
+fn parse_pipeline(input: &str) -> Result<Vec<Vec<String>>, String> {
+    let mut commands = Vec::new();
+    for command_str in input.split('|') {
+        let tokens = parse_line(command_str.trim())?;
+        if !tokens.is_empty() {
+            commands.push(tokens);
+        }
+    }
+    Ok(commands)
+}
+
 fn parse_line(input: &str) -> Result<Vec<String>, String> {
     enum State {
         Normal,
@@ -295,6 +335,18 @@ fn parse_line(input: &str) -> Result<Vec<String>, String> {
                         tokens.push(current.clone());
                         current.clear();
                     }
+                }
+                '>' | '<' => {
+                    if !current.is_empty() {
+                        tokens.push(current.clone());
+                        current.clear();
+                    }
+                    current.push(c);
+                    if c == '>' && chars.peek() == Some(&'>') {
+                        current.push(chars.next().unwrap());
+                    }
+                    tokens.push(current.clone());
+                    current.clear();
                 }
                 '\'' => state = State::Single,
                 '"' => state = State::Double,
@@ -339,6 +391,56 @@ fn parse_line(input: &str) -> Result<Vec<String>, String> {
         }
     }
     Ok(tokens)
+}
+
+fn process_redirections(tokens: Vec<String>) -> Result<ParsedCommand, String> {
+    let mut argv = Vec::new();
+    let mut stdin_path = None;
+    let mut stdout_path = None;
+    let mut stdout_append = false;
+    let mut iter = tokens.into_iter().peekable();
+
+    while let Some(token) = iter.next() {
+        match token.as_str() {
+            "<" => {
+                if stdin_path.is_some() {
+                    return Err("入力リダイレクトが複数あります".into());
+                }
+                stdin_path = iter.next();
+                if stdin_path.is_none() {
+                    return Err("入力リダイレクトの後にファイル名がありません".into());
+                }
+            }
+            ">" => {
+                if stdout_path.is_some() {
+                    return Err("出力リダイレクトが複数あります".into());
+                }
+                stdout_path = iter.next();
+                if stdout_path.is_none() {
+                    return Err("出力リダイレクトの後にファイル名がありません".into());
+                }
+                stdout_append = false;
+            }
+            ">>" => {
+                if stdout_path.is_some() {
+                    return Err("出力リダイレクトが複数あります".into());
+                }
+                stdout_path = iter.next();
+                if stdout_path.is_none() {
+                    return Err("出力リダイレクトの後にファイル名がありません".into());
+                }
+                stdout_append = true;
+            }
+            _ => argv.push(token),
+        }
+    }
+
+    Ok(ParsedCommand {
+        argv,
+        stdin_path,
+        stdout_path,
+        stdout_append,
+    })
 }
 
 fn resolve_command_path(cmd: &str) -> Option<String> {
@@ -405,7 +507,163 @@ fn try_builtin(argv: &[String]) -> bool {
             let code = argv.get(1).and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
             std::process::exit(code);
         }
+        Some("exit") | Some("quit") => {
+            let code = argv.get(1).and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
+            std::process::exit(code);
+        }
+        Some("jobs") => {
+            let jobs = JOBS.lock().unwrap();
+            for (id, job) in jobs.iter() {
+                let pidlist = job.pids.iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                println!("[{}] 実行中  {}    {}", id, pidlist, job.cmd);
+            }
+            true
+        }
+        Some("fg") => {
+            if let Some(arg) = argv.get(1) {
+                let jid = arg.trim_start_matches('%').parse::<usize>().unwrap_or(0);
+                // テーブルから取り出して SIGCONT → フォアグラウンド待ち
+                if let Some(job) = JOBS.lock().unwrap().remove(&jid) {
+                    for &pid in &job.pids {
+                        let _ = kill(Pid::from_raw(pid as i32), Signal::SIGCONT);
+                    }
+                    if let Some(&last_pid) = job.pids.last() {
+                        let _ = waitpid(Pid::from_raw(last_pid as i32), None);
+                    }
+                } else {
+                    eprintln!("fg: ジョブ {} が見つかりません", jid);
+                }
+            } else {
+                eprintln!("fg: ジョブ番号を指定してください");
+            }
+            true
+        }
+        Some("bg") => {
+            if let Some(arg) = argv.get(1) {
+                let jid = arg.trim_start_matches('%').parse::<usize>().unwrap_or(0);
+                if let Some(job) = JOBS.lock().unwrap().get(&jid) {
+                    for &pid in &job.pids {
+                        let _ = kill(Pid::from_raw(pid as i32), Signal::SIGCONT);
+                    }
+                    println!("[{}] {} をバックグラウンドで再開", jid, job.cmd);
+                } else {
+                    eprintln!("bg: ジョブ {} が見つかりません", jid);
+                }
+            } else {
+                eprintln!("bg: ジョブ番号を指定してください");
+            }
+            true
+        }
         _ => false,
+    }
+}
+
+fn run_pipeline(commands: &[Vec<String>]) -> i32 {
+    if commands.is_empty() {
+        return 0;
+    }
+
+    let mut children = Vec::new();
+    let mut prev_stdout = Stdio::inherit();
+
+    for (i, raw_argv) in commands.iter().enumerate() {
+        let parsed_cmd = match process_redirections(raw_argv.clone()) {
+            Ok(cmd) => cmd,
+            Err(e) => {
+                eprintln!("{e}");
+                return 1;
+            }
+        };
+
+        let mut argv_exec = parsed_cmd.argv;
+        if argv_exec.is_empty() {
+            continue;
+        }
+        if let Some(path) = resolve_command_path(&argv_exec[0]) {
+            argv_exec[0] = path;
+        }
+
+        let is_first = i == 0;
+        let is_last = i == commands.len() - 1;
+
+        let stdin = if is_first {
+            if let Some(path) = parsed_cmd.stdin_path {
+                match File::open(path) {
+                    Ok(file) => Stdio::from(file),
+                    Err(e) => {
+                        eprintln!("ファイルを開けませんでした: {e}");
+                        return 1;
+                    }
+                }
+            } else {
+                prev_stdout
+            }
+        } else {
+            prev_stdout
+        };
+
+        let stdout = if is_last {
+            if let Some(path) = parsed_cmd.stdout_path {
+                let mut options = OpenOptions::new();
+                options.write(true).create(true);
+                if parsed_cmd.stdout_append {
+                    options.append(true);
+                } else {
+                    options.truncate(true);
+                }
+                match options.open(path) {
+                    Ok(file) => Stdio::from(file),
+                    Err(e) => {
+                        eprintln!("ファイルを開けませんでした: {e}");
+                        return 1;
+                    }
+                }
+            } else {
+                Stdio::inherit()
+            }
+        } else {
+            Stdio::piped()
+        };
+
+        let mut command = Command::new(&argv_exec[0]);
+        let child = command
+            .args(&argv_exec[1..])
+            .stdin(stdin)
+            .stdout(stdout)
+            .stderr(Stdio::inherit())
+            .spawn();
+
+        match child {
+            Ok(mut child) => {
+                prev_stdout = child.stdout.take().map_or(Stdio::null(), Stdio::from);
+                children.push(child);
+            }
+            Err(e) => {
+                match e.raw_os_error() {
+                    Some(2) => eprintln!("知らねーよ、そんなの: {}", argv_exec[0]),
+                    Some(13) => eprintln!("駄目です（権限なし）: {}", argv_exec[0]),
+                    Some(code) => eprintln!("これもうわかんねぇな… {code}: {e}"),
+                    None => eprintln!("よくわかんなかったです(OSエラー): {e}"),
+                }
+                for mut child in children {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                return 1;
+            }
+        }
+    }
+
+    if let Some(last_child) = children.last_mut() {
+        match last_child.wait() {
+            Ok(status) => status.code().unwrap_or(1),
+            Err(_) => 1,
+        }
+    } else {
+        0
     }
 }
 
@@ -413,10 +671,61 @@ fn run_external(argv: &[String]) -> i32 {
     if argv.is_empty() {
         return 0;
     }
-    let status = Command::new(&argv[0])
-        .args(&argv[1..])
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
+
+    let parsed_cmd = match process_redirections(argv.to_vec()) {
+        Ok(cmd) => cmd,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+
+    if parsed_cmd.argv.is_empty() {
+        return 0;
+    }
+
+    let mut command = Command::new(&parsed_cmd.argv[0]);
+    if let Some(path) = resolve_command_path(&parsed_cmd.argv[0]) {
+        command = Command::new(path);
+    }
+
+    if let Some(path) = parsed_cmd.stdin_path {
+        match File::open(path) {
+            Ok(file) => {
+                command.stdin(Stdio::from(file));
+            }
+            Err(e) => {
+                eprintln!("ファイルを開けませんでした: {e}");
+                return 1;
+            }
+        }
+    } else {
+        command.stdin(Stdio::inherit());
+    }
+
+    if let Some(path) = parsed_cmd.stdout_path {
+        let mut options = OpenOptions::new();
+        options.write(true).create(true);
+        if parsed_cmd.stdout_append {
+            options.append(true);
+        } else {
+            options.truncate(true);
+        }
+        match options.open(path) {
+            Ok(file) => {
+                command.stdout(Stdio::from(file));
+            }
+            Err(e) => {
+                eprintln!("ファイルを開けませんでした: {e}");
+                return 1;
+            }
+        }
+    } else {
+        command.stdout(Stdio::inherit());
+    }
+
+    let status = command
+        .args(&parsed_cmd.argv[1..])
         .stderr(Stdio::inherit())
         .status();
     match status {
@@ -437,8 +746,8 @@ fn run_external(argv: &[String]) -> i32 {
         },
         Err(e) => {
             match e.raw_os_error() {
-                Some(2) => eprintln!("知らねーよ、そんなの"),
-                Some(13) => eprintln!("駄目です（権限なし）"),
+                Some(2) => eprintln!("知らねーよ、そんなの: {}", parsed_cmd.argv[0]),
+                Some(13) => eprintln!("駄目です（権限なし）: {}", parsed_cmd.argv[0]),
                 Some(code) => eprintln!("これもうわかんねぇな… {code}: {e}"),
                 None => eprintln!("よくわかんなかったです(OSエラー): {e}"),
             }
@@ -447,7 +756,185 @@ fn run_external(argv: &[String]) -> i32 {
     }
 }
 
+/// すべてのシグナルハンドラをまとめて初期化
+fn setup_signal_handlers() -> std::io::Result<()> {
+    // SIGINT (^C) と SIGCHLD を捕捉
+    let mut signals = Signals::new(&[SIGINT, SIGCHLD])?;
+    std::thread::spawn(move || {
+        for sig in signals.forever() {
+            match sig {
+                SIGINT => {
+                    // readline が中断済みなので改行だけ差し込む
+                    eprintln!();          // stdout へ出すとプロンプトが壊れる
+                }
+                SIGCHLD => reap_zombies(),
+                _ => {}
+            }
+        }
+    });
+    Ok(())
+}
+
+/// 終了した子プロセスを回収して JOBS から削除
+fn reap_zombies() {
+    loop {
+        match waitpid(None, Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::Exited(pid, status)) => {
+                remove_job(pid.as_raw() as u32, status);
+            }
+            Ok(WaitStatus::Signaled(pid, sig, _)) => {
+                remove_job(pid.as_raw() as u32, 128 + sig as i32);
+            }
+            Ok(WaitStatus::StillAlive) => break,
+            Ok(_) => {}
+            Err(nix::errno::Errno::ECHILD) => break,
+            Err(e) => {
+                eprintln!("waitpid 失敗: {e}");
+                break;
+            }
+        }
+    }
+}
+
+/// 終了したジョブを管理テーブルから外し、ユーザへ通知
+fn remove_job(pid: u32, status: i32) {
+    // ① 不変参照で見つけた (jid, Job) をクローンして取得
+    let maybe: Option<(usize, Job)> = {
+        let jobs_guard = JOBS.lock().unwrap();
+        jobs_guard
+            .iter()
+            .find(|(_, job)| job.pids.contains(&pid))
+            .map(|(&jid, job)| (jid, job.clone()))
+    }; // ← ここで jobs_guard はドロップされる
+
+    if let Some((jid, job)) = maybe {
+        // ② 改めて可変ガードを取得して削除
+        let mut jobs_guard = JOBS.lock().unwrap();
+        jobs_guard.remove(&jid);
+        println!("[{}] 終了 ({})  {}", jid, status, job.cmd);
+    }
+}
+
+/// 末尾の '&' を判定して削除
+fn split_background(input: &str) -> (String, bool) {
+    let trimmed = input.trim_end();
+    if trimmed.ends_with('&') {
+        (
+            trimmed[..trimmed.len() - 1].trim_end().to_string(),
+            true,
+        )
+    } else {
+        (input.to_string(), false)
+    }
+}
+
+/// wait せずにパイプラインを起動し、子プロセス配列を返す
+fn spawn_pipeline(commands: &[Vec<String>]) -> Result<Vec<std::process::Child>, String> {
+    if commands.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let mut children = Vec::new();
+    let mut prev_stdout = Stdio::inherit();
+
+    for (i, raw_argv) in commands.iter().enumerate() {
+        let parsed_cmd = process_redirections(raw_argv.clone())?;
+        let mut argv = parsed_cmd.argv;
+        if argv.is_empty() {
+            continue;
+        }
+        if let Some(path) = resolve_command_path(&argv[0]) {
+            argv[0] = path;
+        }
+
+        let is_first = i == 0;
+        let is_last = i + 1 == commands.len();
+
+        let stdin = if is_first {
+            if let Some(p) = parsed_cmd.stdin_path {
+                Stdio::from(File::open(p).map_err(|e| format!("open stdin: {e}"))?)
+            } else {
+                prev_stdout
+            }
+        } else {
+            prev_stdout
+        };
+
+        let stdout = if is_last {
+            if let Some(p) = parsed_cmd.stdout_path {
+                let mut opt = OpenOptions::new();
+                opt.write(true).create(true);
+                if parsed_cmd.stdout_append {
+                    opt.append(true);
+                } else {
+                    opt.truncate(true);
+                }
+                Stdio::from(opt.open(p).map_err(|e| format!("open stdout: {e}"))?)
+            } else {
+                Stdio::inherit()
+            }
+        } else {
+            Stdio::piped()
+        };
+
+        let mut child = Command::new(&argv[0])
+            .args(&argv[1..])
+            .stdin(stdin)
+            .stdout(stdout)
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|e| format!("spawn 失敗: {e}"))?;
+
+        // 次のコマンドの stdin 用に stdout を跳ね渡し
+        prev_stdout = child
+            .stdout
+            .take()
+            .map_or(Stdio::null(), |o| Stdio::from(o));
+
+        children.push(child);
+    }
+    Ok(children)
+}
+
+/// '&' 付きで投入されたジョブをバックグラウンドで実行
+fn run_pipeline_background(commands: &[Vec<String>]) -> Result<(), String> {
+    let children = spawn_pipeline(commands)?;
+    if children.is_empty() {
+        return Ok(());
+    }
+
+    let job_id = JOB_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let pids: Vec<u32> = children.iter().map(|c| c.id()).collect();
+
+    let cmdline = commands
+        .iter()
+        .flat_map(|v| v.iter())
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    {
+        let mut jobs = JOBS.lock().unwrap();
+        jobs.insert(
+            job_id,
+            Job {
+                id: job_id,
+                pids: pids.clone(),
+                cmd: cmdline.clone(),
+            },
+        );
+    }
+
+    // 子プロセスは signal handler が回収するので Drop は OK
+    std::mem::drop(children);
+
+    println!("[{job_id}] {}", pids[0]);
+    Ok(())
+}
+
+
 fn main() -> rustyline::Result<()> {
+    setup_signal_handlers().expect("signal 初期化失敗");
     let config: Config = ConfigBuilder::new()
         .history_ignore_dups(true)?
         .completion_type(CompletionType::List)
@@ -472,6 +959,7 @@ fn main() -> rustyline::Result<()> {
         let prompt = build_prompt(last_status);
         match rl.readline(&prompt) {
             Ok(line) => {
+                let (line, bg) = split_background(&line);
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
                     continue;
@@ -479,20 +967,35 @@ fn main() -> rustyline::Result<()> {
                 rl.add_history_entry(trimmed)?;
                 rl.helper_mut().unwrap().history.push(trimmed.to_owned());
 
-                match parse_line(trimmed) {
-                    Ok(argv) if argv.is_empty() => continue,
-                    Ok(argv) => {
-                        let mut argv_exec = argv.clone();
-                        if let Some(p) = resolve_command_path(&argv_exec[0]) {
-                            argv_exec[0] = p;
-                            last_status = run_external(&argv_exec);
-                        } else if try_builtin(&argv) {
-                            last_status = 0;
+                match parse_pipeline(trimmed) {
+                    Ok(commands) if commands.is_empty() => continue,
+                    Ok(commands) => {
+                        if bg {
+                            // バックグラウンド
+                            if let Err(e) = run_pipeline_background(&commands) {
+                                eprintln!("{e}");
+                                last_status = 1;
+                            } else {
+                                last_status = 0;
+                            }
+                            continue;
+                        }
+
+                        if commands.len() == 1 {
+                            let argv = &commands[0];
+                            if try_builtin(argv) {
+                                last_status = 0;
+                            } else {
+                                last_status = run_external(argv);
+                            }
                         } else {
-                            last_status = run_external(&argv_exec);
+                            last_status = run_pipeline(&commands);
                         }
                     }
-                    Err(e) => eprintln!("{e}"),
+                    Err(e) => {
+                        eprintln!("{e}");
+                        last_status = 1;
+                    }
                 }
             }
             Err(ReadlineError::Interrupted) => {
