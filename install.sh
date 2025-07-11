@@ -31,3 +31,8 @@ sudo cp target/release/unko "$INSTALL_PATH"
 if ! grep -Fxq "$INSTALL_PATH" /etc/shells; then
   echo "$INSTALL_PATH" | sudo tee -a /etc/shells > /dev/null
 fi
+
+echo ""
+echo "Installation complete!"
+echo "You can now set unko as your default shell by running:"
+echo "  chsh -s $INSTALL_PATH"
