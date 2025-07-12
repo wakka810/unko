@@ -43,10 +43,12 @@ cargo build --release
 ## 依存クレート
 - `ansi_term`
 - `dirs`
+- `fs`
 - `git2`
+- `libc`
+- `nix`
 - `once_cell`
 - `rayon`
-- `regex`
 - `rustyline`
 
 ## 今後の予定
