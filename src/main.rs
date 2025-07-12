@@ -1,14 +1,13 @@
 use std::{
     borrow::Cow,
-    collections::{HashMap, HashSet},
+    collections::{HashSet},
     env,
     fs,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
-    sync::Mutex,
+    process::{ChildStdout, Command, Stdio},
 };
 
-use ansi_term::Colour::{Blue, Fixed, Green, Purple, Red, Yellow};
+use ansi_term::Colour::{Blue, Fixed, Green, Purple, Yellow};
 use git2::Repository;
 use once_cell::sync::Lazy;
 use rayon::prelude::*;
@@ -65,7 +64,7 @@ impl Completer for ShellHelper {
         ctx: &Context<'_>,
     ) -> rustyline::Result<(usize, Vec<Pair>)> {
         let (start, word) = extract_current_token(line, pos);
-        
+
         if word.is_empty() {
             let mut out = Vec::new();
             for &b in ["echo", "ls", "cd", "pwd", "exit", "quit"].iter() {
@@ -207,7 +206,7 @@ impl Validator for ShellHelper {
     }
 }
 
-fn build_prompt(last_status: i32) -> String {
+fn build_prompt() -> String {
     let user = env::var("USER").unwrap_or_default();
     let cwd = env::current_dir().unwrap_or_default();
     let path_display = if let Some(home) = dirs::home_dir() {
@@ -242,7 +241,6 @@ fn build_prompt(last_status: i32) -> String {
         Blue.paint(path_display),
         git_str,
         Blue.paint(">"),
-        // status_str
     )
 }
 
@@ -277,69 +275,79 @@ fn expand_var<I: Iterator<Item = char>>(iter: &mut std::iter::Peekable<I>) -> St
     }
 }
 
-fn parse_line(input: &str) -> Result<Vec<String>, String> {
-    enum State {
-        Normal,
-        Single,
-        Double,
-    }
-    let mut state = State::Normal;
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut chars = input.chars().peekable();
-    while let Some(c) = chars.next() {
-        match state {
-            State::Normal => match c {
-                ' ' | '\t' => {
-                    if !current.is_empty() {
-                        tokens.push(current.clone());
-                        current.clear();
-                    }
-                }
-                '\'' => state = State::Single,
-                '"' => state = State::Double,
-                '\\' => {
-                    if let Some(n) = chars.next() {
-                        current.push(n);
-                    }
-                }
-                '$' => current.push_str(&expand_var(&mut chars)),
-                _ => current.push(c),
-            },
-            State::Single => {
-                if c == '\'' {
-                    state = State::Normal;
-                } else {
-                    current.push(c);
-                }
+fn split_by_pipe(tokens: &[String]) -> Vec<Vec<String>> {
+    let mut cmds = Vec::new();
+    let mut current = Vec::new();
+    for t in tokens {
+        if t == "|" {
+            if !current.is_empty() {
+                cmds.push(current);
+                current = Vec::new();
             }
-            State::Double => match c {
-                '"' => state = State::Normal,
-                '\\' => {
-                    if let Some(n) = chars.next() {
-                        current.push(n);
-                    }
-                }
-                '$' => current.push_str(&expand_var(&mut chars)),
-                _ => current.push(c),
-            },
+        } else {
+            current.push(t.clone());
         }
-    }
-    if !matches!(state, State::Normal) {
-        return Err("これもうわかんねぇな…: unmatched quote".into());
     }
     if !current.is_empty() {
-        tokens.push(current);
+        cmds.push(current);
     }
-    let home = env::var("HOME").unwrap_or_default();
-    for t in tokens.iter_mut() {
-        if t.starts_with('~') && (t.len() == 1 || t.as_bytes()[1] == b'/') {
-            let rest = &t[1..];
-            *t = format!("{home}{rest}");
+    cmds
+}
+
+fn run_pipeline(commands: Vec<Vec<String>>) -> i32 {
+    if commands.is_empty() {
+        return 0;
+    }
+
+    let last_idx = commands.len() - 1;
+    let mut previous_stdout: Option<ChildStdout> = None;
+    let mut children = Vec::new();
+
+    for (idx, argv) in commands.into_iter().enumerate() {
+        let mut argv_exec = argv.clone();
+        if let Some(p) = resolve_command_path(&argv_exec[0]) {
+            argv_exec[0] = p;
+        }
+
+        let mut cmd = Command::new(&argv_exec[0]);
+        cmd.args(&argv_exec[1..]);
+
+        if let Some(stdin_pipe) = previous_stdout.take() {
+            cmd.stdin(Stdio::from(stdin_pipe));
+        } else {
+            cmd.stdin(Stdio::inherit());
+        }
+
+        if idx == last_idx {
+            cmd.stdout(Stdio::inherit());
+        } else {
+            cmd.stdout(Stdio::piped());
+        }
+
+        cmd.stderr(Stdio::inherit());
+
+        match cmd.spawn() {
+            Ok(mut child) => {
+                previous_stdout = child.stdout.take();
+                children.push(child);
+            }
+            Err(e) => {
+                eprintln!("コマンド実行失敗: {}: {}", argv_exec[0], e);
+                return 1;
+            }
         }
     }
-    Ok(tokens)
+
+    let mut last_status = 0;
+    for mut child in children {
+        match child.wait() {
+            Ok(status) => last_status = status.code().unwrap_or(1),
+            Err(_) => last_status = 1,
+        }
+    }
+    last_status
 }
+
 
 fn resolve_command_path(cmd: &str) -> Option<String> {
     if cmd.contains('/') {
@@ -447,6 +455,71 @@ fn run_external(argv: &[String]) -> i32 {
     }
 }
 
+fn parse_line(input: &str) -> Result<Vec<String>, String> {
+    enum State {
+        Normal,
+        Single,
+        Double,
+    }
+
+    let mut state = State::Normal;
+    let mut tokens: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut chars = input.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        match state {
+            State::Normal => match c {
+                ' ' | '\t' | '\n' => {
+                    if !current.is_empty() {
+                        tokens.push(current.trim().to_string());
+                        current.clear();
+                    }
+                }
+                '\'' => state = State::Single,
+                '"'  => state = State::Double,
+                '\\' => {
+                    if let Some(n) = chars.next() {
+                        current.push(n);
+                    }
+                }
+                '$'  => current.push_str(&expand_var(&mut chars)),
+                _    => current.push(c),
+            },
+            State::Single => {
+                if c == '\'' {
+                    state = State::Normal;
+                } else {
+                    current.push(c);
+                }
+            }
+            State::Double => match c {
+                '"'  => state = State::Normal,
+                '\\' => {
+                    if let Some(n) = chars.next() {
+                        current.push(n);
+                    }
+                }
+                '$'  => current.push_str(&expand_var(&mut chars)),
+                _    => current.push(c),
+            },
+        }
+    } 
+
+    if !current.is_empty() {
+        tokens.push(current.trim().to_string());
+    }
+
+    let home = env::var("HOME").unwrap_or_default();
+    for t in tokens.iter_mut() {
+        if t.starts_with('~') && (t.len() == 1 || t.as_bytes()[1] == b'/') {
+            let rest = &t[1..];
+            *t = format!("{}{}", home, rest);
+        }
+    }
+    Ok(tokens)
+}
+
 fn main() -> rustyline::Result<()> {
     let config: Config = ConfigBuilder::new()
         .history_ignore_dups(true)?
@@ -468,47 +541,90 @@ fn main() -> rustyline::Result<()> {
     let _ = rl.load_history(&hist_path);
 
     let mut last_status = 0;
-    loop {
-        let prompt = build_prompt(last_status);
-        match rl.readline(&prompt) {
-            Ok(line) => {
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                rl.add_history_entry(trimmed)?;
-                rl.helper_mut().unwrap().history.push(trimmed.to_owned());
 
-                match parse_line(trimmed) {
-                    Ok(argv) if argv.is_empty() => continue,
-                    Ok(argv) => {
-                        let mut argv_exec = argv.clone();
-                        if let Some(p) = resolve_command_path(&argv_exec[0]) {
-                            argv_exec[0] = p;
-                            last_status = run_external(&argv_exec);
-                        } else if try_builtin(&argv) {
-                            last_status = 0;
-                        } else {
-                            last_status = run_external(&argv_exec);
-                        }
+    loop {
+        let mut full_input = String::new();
+        // build_prompt(last_status)
+        let mut prompt = build_prompt();
+
+        loop {
+            match rl.readline(&prompt) {
+                Ok(line) => {
+                    if full_input.is_empty() && line.trim().is_empty() {
+                        continue;
                     }
-                    Err(e) => eprintln!("{e}"),
+
+                    if line.ends_with('\\') {
+                        let mut part = line.trim_end_matches('\\').trim_end().to_string();
+                        if !full_input.trim_end().ends_with('|')
+                            && !part.trim_start().starts_with('|')
+                            && !full_input.is_empty()
+                        {
+                            full_input.push(' ');
+                        }
+
+                        full_input.push_str(part.trim_start());
+
+                        prompt = "> ".into();
+                        continue;
+                    } else {
+                        let part = line.trim_end();
+                        if !full_input.trim_end().ends_with('|')
+                            && !part.trim_start().starts_with('|')
+                            && !full_input.is_empty()
+                        {
+                            full_input.push(' ');
+                        }
+                        full_input.push_str(part.trim_start());
+                        break;
+                    }
                 }
-            }
-            Err(ReadlineError::Interrupted) => {
-                println!("^C");
-                last_status = 130;
-            }
-            Err(ReadlineError::Eof) => {
-                println!();
-                break;
-            }
-            Err(err) => {
-                eprintln!("これもうわかんねぇな…: {err}");
-                break;
+
+                Err(ReadlineError::Interrupted) => {
+                    println!("^C");
+                    last_status = 130;
+                    full_input.clear();
+                    break;
+                }
+                Err(ReadlineError::Eof) => {
+                    println!();
+                    return Ok(());
+                }
+                Err(err) => {
+                    eprintln!("これもうわかんねぇな…: {err}");
+                    return Ok(());
+                }
             }
         }
+
+        let trimmed = full_input.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        rl.add_history_entry(trimmed)?;
+        rl.helper_mut().unwrap().history.push(trimmed.to_owned());
+
+        match parse_line(trimmed) {
+            Ok(tokens) if tokens.is_empty() => continue,
+            Ok(tokens) => {
+                let pipeline = split_by_pipe(&tokens);
+
+                if pipeline.len() > 1 {
+                    last_status = run_pipeline(pipeline);
+                } else {
+                    let mut argv_exec = tokens.clone();
+                    if let Some(p) = resolve_command_path(&argv_exec[0]) {
+                        argv_exec[0] = p;
+                        last_status = run_external(&argv_exec);
+                    } else if try_builtin(&tokens) {
+                        last_status = 0;
+                    } else {
+                        last_status = run_external(&argv_exec);
+                    }
+                }
+            }
+            Err(e) => eprintln!("{e}"),
+        }
     }
-    let _ = rl.append_history(&hist_path);
-    Ok(())
 }
