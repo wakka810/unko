@@ -755,7 +755,6 @@ dependencies = [
  "fs",
  "git2",
  "libc",
- "nix",
  "once_cell",
  "rayon",
  "rustyline",
