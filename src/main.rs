@@ -3,17 +3,17 @@ use std::{
     collections::{HashMap, HashSet},
     env,
     fs::{self, File, OpenOptions},
-    os::unix::io::AsRawFd,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::Mutex,
 };
 
-use ansi_term::Colour::{Blue, Fixed, Green, Purple, Red, Yellow};
+use ansi_term::Colour::{Blue, Fixed, Green, Purple, Yellow};
 use git2::Repository;
 use once_cell::sync::Lazy;
 use rayon::prelude::*;
 use rustyline::{
+    Context, Editor, Helper,
     completion::{Completer, FilenameCompleter, Pair},
     config::{Builder as ConfigBuilder, CompletionType, Config, EditMode},
     error::ReadlineError,
@@ -21,31 +21,30 @@ use rustyline::{
     hint::Hinter,
     history::FileHistory,
     validate::{MatchingBracketValidator, Validator},
-    Context, Editor, Helper,
 };
 
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
-};
+use nix::sys::signal::{Signal, killpg};
+use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+use nix::unistd::{Pid, getpid, setpgid};
 use signal_hook::{
     consts::{SIGCHLD, SIGINT},
     iterator::Signals,
 };
-use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-use nix::sys::signal::{kill, Signal};
-use nix::unistd::Pid;
+use std::os::unix::process::CommandExt;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 static JOB_COUNTER: AtomicUsize = AtomicUsize::new(1);
 static JOBS: Lazy<Mutex<HashMap<usize, Job>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static SHELL_PGID: Lazy<Pid> = Lazy::new(|| getpid());
+static TTY_FD: Lazy<i32> = Lazy::new(|| 0);
 
-#[derive(Debug , Clone)]
+#[derive(Debug, Clone)]
 struct Job {
     id: usize,
     pids: Vec<u32>,
+    pgid: Pid,
     cmd: String,
 }
-
 
 static BIN_CACHE: Lazy<Vec<String>> = Lazy::new(|| {
     let mut bins = if let Some(path_var) = env::var_os("PATH") {
@@ -112,7 +111,9 @@ impl Completer for ShellHelper {
             }
 
             let mut out = Vec::new();
-            let builtins = ["echo", "ls", "cd", "pwd", "exit", "quit", "jobs", "fg", "bg"];
+            let builtins = [
+                "echo", "ls", "cd", "pwd", "exit", "quit", "jobs", "fg", "bg",
+            ];
             for &b in builtins.iter() {
                 if b.starts_with(word) {
                     out.push(Pair {
@@ -140,9 +141,7 @@ fn is_first_token(line: &str, pos: usize) -> bool {
     !line[..pos].contains(char::is_whitespace)
 }
 fn extract_current_token(line: &str, pos: usize) -> (usize, &str) {
-    let start = line[..pos]
-        .rfind(char::is_whitespace)
-        .map_or(0, |i| i + 1);
+    let start = line[..pos].rfind(char::is_whitespace).map_or(0, |i| i + 1);
     (start, &line[start..pos])
 }
 fn is_executable(path: &Path) -> bool {
@@ -514,7 +513,9 @@ fn try_builtin(argv: &[String]) -> bool {
         Some("jobs") => {
             let jobs = JOBS.lock().unwrap();
             for (id, job) in jobs.iter() {
-                let pidlist = job.pids.iter()
+                let pidlist = job
+                    .pids
+                    .iter()
                     .map(ToString::to_string)
                     .collect::<Vec<_>>()
                     .join(" ");
@@ -525,13 +526,14 @@ fn try_builtin(argv: &[String]) -> bool {
         Some("fg") => {
             if let Some(arg) = argv.get(1) {
                 let jid = arg.trim_start_matches('%').parse::<usize>().unwrap_or(0);
-                // テーブルから取り出して SIGCONT → フォアグラウンド待ち
                 if let Some(job) = JOBS.lock().unwrap().remove(&jid) {
-                    for &pid in &job.pids {
-                        let _ = kill(Pid::from_raw(pid as i32), Signal::SIGCONT);
+                    unsafe {
+                        libc::tcsetpgrp(*TTY_FD, job.pgid.as_raw());
                     }
-                    if let Some(&last_pid) = job.pids.last() {
-                        let _ = waitpid(Pid::from_raw(last_pid as i32), None);
+                    let _ = killpg(job.pgid, Signal::SIGCONT);
+                    let _ = waitpid(Pid::from_raw(-job.pgid.as_raw()), None);
+                    unsafe {
+                        libc::tcsetpgrp(*TTY_FD, SHELL_PGID.as_raw());
                     }
                 } else {
                     eprintln!("fg: ジョブ {} が見つかりません", jid);
@@ -545,9 +547,7 @@ fn try_builtin(argv: &[String]) -> bool {
             if let Some(arg) = argv.get(1) {
                 let jid = arg.trim_start_matches('%').parse::<usize>().unwrap_or(0);
                 if let Some(job) = JOBS.lock().unwrap().get(&jid) {
-                    for &pid in &job.pids {
-                        let _ = kill(Pid::from_raw(pid as i32), Signal::SIGCONT);
-                    }
+                    let _ = killpg(job.pgid, Signal::SIGCONT);
                     println!("[{}] {} をバックグラウンドで再開", jid, job.cmd);
                 } else {
                     eprintln!("bg: ジョブ {} が見つかりません", jid);
@@ -566,194 +566,47 @@ fn run_pipeline(commands: &[Vec<String>]) -> i32 {
         return 0;
     }
 
-    let mut children = Vec::new();
-    let mut prev_stdout = Stdio::inherit();
-
-    for (i, raw_argv) in commands.iter().enumerate() {
-        let parsed_cmd = match process_redirections(raw_argv.clone()) {
-            Ok(cmd) => cmd,
-            Err(e) => {
-                eprintln!("{e}");
-                return 1;
-            }
-        };
-
-        let mut argv_exec = parsed_cmd.argv;
-        if argv_exec.is_empty() {
-            continue;
-        }
-        if let Some(path) = resolve_command_path(&argv_exec[0]) {
-            argv_exec[0] = path;
-        }
-
-        let is_first = i == 0;
-        let is_last = i == commands.len() - 1;
-
-        let stdin = if is_first {
-            if let Some(path) = parsed_cmd.stdin_path {
-                match File::open(path) {
-                    Ok(file) => Stdio::from(file),
-                    Err(e) => {
-                        eprintln!("ファイルを開けませんでした: {e}");
-                        return 1;
-                    }
-                }
-            } else {
-                prev_stdout
-            }
-        } else {
-            prev_stdout
-        };
-
-        let stdout = if is_last {
-            if let Some(path) = parsed_cmd.stdout_path {
-                let mut options = OpenOptions::new();
-                options.write(true).create(true);
-                if parsed_cmd.stdout_append {
-                    options.append(true);
-                } else {
-                    options.truncate(true);
-                }
-                match options.open(path) {
-                    Ok(file) => Stdio::from(file),
-                    Err(e) => {
-                        eprintln!("ファイルを開けませんでした: {e}");
-                        return 1;
-                    }
-                }
-            } else {
-                Stdio::inherit()
-            }
-        } else {
-            Stdio::piped()
-        };
-
-        let mut command = Command::new(&argv_exec[0]);
-        let child = command
-            .args(&argv_exec[1..])
-            .stdin(stdin)
-            .stdout(stdout)
-            .stderr(Stdio::inherit())
-            .spawn();
-
-        match child {
-            Ok(mut child) => {
-                prev_stdout = child.stdout.take().map_or(Stdio::null(), Stdio::from);
-                children.push(child);
-            }
-            Err(e) => {
-                match e.raw_os_error() {
-                    Some(2) => eprintln!("知らねーよ、そんなの: {}", argv_exec[0]),
-                    Some(13) => eprintln!("駄目です（権限なし）: {}", argv_exec[0]),
-                    Some(code) => eprintln!("これもうわかんねぇな… {code}: {e}"),
-                    None => eprintln!("よくわかんなかったです(OSエラー): {e}"),
-                }
-                for mut child in children {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                }
-                return 1;
-            }
-        }
-    }
-
-    if let Some(last_child) = children.last_mut() {
-        match last_child.wait() {
-            Ok(status) => status.code().unwrap_or(1),
-            Err(_) => 1,
-        }
-    } else {
-        0
-    }
-}
-
-fn run_external(argv: &[String]) -> i32 {
-    if argv.is_empty() {
-        return 0;
-    }
-
-    let parsed_cmd = match process_redirections(argv.to_vec()) {
-        Ok(cmd) => cmd,
+    let (mut children, pgid) = match spawn_pipeline(commands, false) {
+        Ok(v) => v,
         Err(e) => {
             eprintln!("{e}");
             return 1;
         }
     };
 
-    if parsed_cmd.argv.is_empty() {
-        return 0;
+    if pgid.as_raw() != 0 {
+        unsafe {
+            libc::tcsetpgrp(*TTY_FD, pgid.as_raw());
+        }
     }
 
-    let mut command = Command::new(&parsed_cmd.argv[0]);
-    if let Some(path) = resolve_command_path(&parsed_cmd.argv[0]) {
-        command = Command::new(path);
-    }
-
-    if let Some(path) = parsed_cmd.stdin_path {
-        match File::open(path) {
-            Ok(file) => {
-                command.stdin(Stdio::from(file));
-            }
+    let mut status_code = 0;
+    loop {
+        match waitpid(Pid::from_raw(-pgid.as_raw()), None) {
+            Ok(WaitStatus::Exited(_, s)) => status_code = s,
+            Ok(WaitStatus::Signaled(_, sig, _)) => status_code = 128 + sig as i32,
+            Ok(_) => continue,
+            Err(nix::errno::Errno::ECHILD) => break,
             Err(e) => {
-                eprintln!("ファイルを開けませんでした: {e}");
-                return 1;
+                eprintln!("waitpid 失敗: {e}");
+                break;
             }
         }
-    } else {
-        command.stdin(Stdio::inherit());
     }
 
-    if let Some(path) = parsed_cmd.stdout_path {
-        let mut options = OpenOptions::new();
-        options.write(true).create(true);
-        if parsed_cmd.stdout_append {
-            options.append(true);
-        } else {
-            options.truncate(true);
-        }
-        match options.open(path) {
-            Ok(file) => {
-                command.stdout(Stdio::from(file));
-            }
-            Err(e) => {
-                eprintln!("ファイルを開けませんでした: {e}");
-                return 1;
-            }
-        }
-    } else {
-        command.stdout(Stdio::inherit());
+    unsafe {
+        libc::tcsetpgrp(*TTY_FD, SHELL_PGID.as_raw());
     }
 
-    let status = command
-        .args(&parsed_cmd.argv[1..])
-        .stderr(Stdio::inherit())
-        .status();
-    match status {
-        Ok(s) => match s.code() {
-            Some(0) => 0,
-            Some(1) => {
-                eprintln!("またのぅ～ (Exit: 1)");
-                1
-            }
-            Some(code) => {
-                eprintln!("ファッ！？ｳｰﾝ…: （コード{code}）");
-                code
-            }
-            None => {
-                eprintln!("んにゃぴ・・・");
-                1
-            }
-        },
-        Err(e) => {
-            match e.raw_os_error() {
-                Some(2) => eprintln!("知らねーよ、そんなの: {}", parsed_cmd.argv[0]),
-                Some(13) => eprintln!("駄目です（権限なし）: {}", parsed_cmd.argv[0]),
-                Some(code) => eprintln!("これもうわかんねぇな… {code}: {e}"),
-                None => eprintln!("よくわかんなかったです(OSエラー): {e}"),
-            }
-            1
-        }
+    for mut c in children {
+        let _ = c.wait();
     }
+
+    status_code
+}
+
+fn run_external(argv: &[String]) -> i32 {
+    run_pipeline(&[argv.to_vec()])
 }
 
 /// すべてのシグナルハンドラをまとめて初期化
@@ -765,7 +618,7 @@ fn setup_signal_handlers() -> std::io::Result<()> {
             match sig {
                 SIGINT => {
                     // readline が中断済みなので改行だけ差し込む
-                    eprintln!();          // stdout へ出すとプロンプトが壊れる
+                    eprintln!(); // stdout へ出すとプロンプトが壊れる
                 }
                 SIGCHLD => reap_zombies(),
                 _ => {}
@@ -819,23 +672,48 @@ fn remove_job(pid: u32, status: i32) {
 fn split_background(input: &str) -> (String, bool) {
     let trimmed = input.trim_end();
     if trimmed.ends_with('&') {
-        (
-            trimmed[..trimmed.len() - 1].trim_end().to_string(),
-            true,
-        )
+        (trimmed[..trimmed.len() - 1].trim_end().to_string(), true)
     } else {
         (input.to_string(), false)
     }
 }
 
+/// コマンドを実行する子プロセスを PG 設定付きで生成
+fn spawn_child(
+    argv: &[String],
+    pgid: Option<Pid>,
+    stdin: Stdio,
+    stdout: Stdio,
+) -> std::io::Result<std::process::Child> {
+    let mut cmd = Command::new(&argv[0]);
+    cmd.args(&argv[1..])
+        .stdin(stdin)
+        .stdout(stdout)
+        .stderr(Stdio::inherit());
+
+    unsafe {
+        cmd.pre_exec(move || {
+            let pid = getpid();
+            let new_pgid = pgid.unwrap_or(pid);
+            setpgid(Pid::from_raw(0), new_pgid)?;
+            Ok(())
+        });
+    }
+    cmd.spawn()
+}
+
 /// wait せずにパイプラインを起動し、子プロセス配列を返す
-fn spawn_pipeline(commands: &[Vec<String>]) -> Result<Vec<std::process::Child>, String> {
+fn spawn_pipeline(
+    commands: &[Vec<String>],
+    background: bool,
+) -> Result<(Vec<std::process::Child>, Pid), String> {
     if commands.is_empty() {
-        return Ok(vec![]);
+        return Ok((vec![], Pid::from_raw(0)));
     }
 
     let mut children = Vec::new();
     let mut prev_stdout = Stdio::inherit();
+    let mut pgid: Option<Pid> = None;
 
     for (i, raw_argv) in commands.iter().enumerate() {
         let parsed_cmd = process_redirections(raw_argv.clone())?;
@@ -851,7 +729,9 @@ fn spawn_pipeline(commands: &[Vec<String>]) -> Result<Vec<std::process::Child>, 
         let is_last = i + 1 == commands.len();
 
         let stdin = if is_first {
-            if let Some(p) = parsed_cmd.stdin_path {
+            if background {
+                Stdio::null()
+            } else if let Some(p) = parsed_cmd.stdin_path {
                 Stdio::from(File::open(p).map_err(|e| format!("open stdin: {e}"))?)
             } else {
                 prev_stdout
@@ -877,15 +757,13 @@ fn spawn_pipeline(commands: &[Vec<String>]) -> Result<Vec<std::process::Child>, 
             Stdio::piped()
         };
 
-        let mut child = Command::new(&argv[0])
-            .args(&argv[1..])
-            .stdin(stdin)
-            .stdout(stdout)
-            .stderr(Stdio::inherit())
-            .spawn()
-            .map_err(|e| format!("spawn 失敗: {e}"))?;
+        let mut child =
+            spawn_child(&argv, pgid, stdin, stdout).map_err(|e| format!("spawn 失敗: {e}"))?;
 
-        // 次のコマンドの stdin 用に stdout を跳ね渡し
+        if pgid.is_none() {
+            pgid = Some(Pid::from_raw(child.id() as i32));
+        }
+
         prev_stdout = child
             .stdout
             .take()
@@ -893,12 +771,13 @@ fn spawn_pipeline(commands: &[Vec<String>]) -> Result<Vec<std::process::Child>, 
 
         children.push(child);
     }
-    Ok(children)
+
+    Ok((children, pgid.unwrap()))
 }
 
 /// '&' 付きで投入されたジョブをバックグラウンドで実行
 fn run_pipeline_background(commands: &[Vec<String>]) -> Result<(), String> {
-    let children = spawn_pipeline(commands)?;
+    let (children, pgid) = spawn_pipeline(commands, true)?;
     if children.is_empty() {
         return Ok(());
     }
@@ -920,6 +799,7 @@ fn run_pipeline_background(commands: &[Vec<String>]) -> Result<(), String> {
             Job {
                 id: job_id,
                 pids: pids.clone(),
+                pgid,
                 cmd: cmdline.clone(),
             },
         );
@@ -928,10 +808,9 @@ fn run_pipeline_background(commands: &[Vec<String>]) -> Result<(), String> {
     // 子プロセスは signal handler が回収するので Drop は OK
     std::mem::drop(children);
 
-    println!("[{job_id}] {}", pids[0]);
+    println!("[{job_id}] {}", pgid);
     Ok(())
 }
-
 
 fn main() -> rustyline::Result<()> {
     setup_signal_handlers().expect("signal 初期化失敗");
