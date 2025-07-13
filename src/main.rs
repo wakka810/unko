@@ -2,7 +2,7 @@ use std::{
     borrow::Cow,
     collections::{HashSet},
     env,
-    fs,
+    fs::{self, File},
     path::{Path, PathBuf},
     process::{ChildStdout, Command, Stdio},
 };
@@ -44,6 +44,14 @@ static BIN_CACHE: Lazy<Vec<String>> = Lazy::new(|| {
     bins.sort();
     bins
 });
+
+#[derive(Debug, Default)]
+struct CommandInfo {
+    args: Vec<String>,
+    stdin_path: Option<PathBuf>,
+    stdout_path: Option<(PathBuf, bool)>, // (path, is_append)
+    stderr_path: Option<PathBuf>,
+}
 
 struct ShellHelper {
     completer: FilenameCompleter,
@@ -275,26 +283,63 @@ fn expand_var<I: Iterator<Item = char>>(iter: &mut std::iter::Peekable<I>) -> St
     }
 }
 
-fn split_by_pipe(tokens: &[String]) -> Vec<Vec<String>> {
-    let mut cmds = Vec::new();
-    let mut current = Vec::new();
-    for t in tokens {
-        if t == "|" {
-            if !current.is_empty() {
-                cmds.push(current);
-                current = Vec::new();
-            }
-        } else {
-            current.push(t.clone());
+fn parse_commands(tokens: &[String]) -> Result<Vec<CommandInfo>, String> {
+    let mut commands = Vec::new();
+    if tokens.is_empty() {
+        return Ok(commands);
+    }
+
+    for group in tokens.split(|token| token == "|") {
+        if group.is_empty() {
+            return Err("構文エラー: パイプの前後にはコマンドが必要です。".to_string());
         }
+
+        let mut cmd_info = CommandInfo::default();
+        let mut it = group.iter();
+        while let Some(token) = it.next() {
+            match token.as_str() {
+                "<" => {
+                    if let Some(path) = it.next() {
+                        cmd_info.stdin_path = Some(PathBuf::from(path));
+                    } else {
+                        return Err("構文エラー: `<` の後にはファイル名が必要です。".to_string());
+                    }
+                }
+                ">" => {
+                    if let Some(path) = it.next() {
+                        cmd_info.stdout_path = Some((PathBuf::from(path), false));
+                    } else {
+                        return Err("構文エラー: `>` の後にはファイル名が必要です。".to_string());
+                    }
+                }
+                ">>" => {
+                    if let Some(path) = it.next() {
+                        cmd_info.stdout_path = Some((PathBuf::from(path), true));
+                    } else {
+                        return Err("構文エラー: `>>` の後にはファイル名が必要です。".to_string());
+                    }
+                }
+                "2>" => {
+                    if let Some(path) = it.next() {
+                        cmd_info.stderr_path = Some(PathBuf::from(path));
+                    } else {
+                        return Err("構文エラー: `2>` の後にはファイル名が必要です。".to_string());
+                    }
+                }
+                _ => {
+                    cmd_info.args.push(token.clone());
+                }
+            }
+        }
+        if cmd_info.args.is_empty() {
+            return Err("構文エラー: 実行するコマンドがありません。".to_string());
+        }
+        commands.push(cmd_info);
     }
-    if !current.is_empty() {
-        cmds.push(current);
-    }
-    cmds
+    Ok(commands)
 }
 
-fn run_pipeline(commands: Vec<Vec<String>>) -> i32 {
+fn run_pipeline(commands: Vec<CommandInfo>) -> i32 {
     if commands.is_empty() {
         return 0;
     }
@@ -303,36 +348,93 @@ fn run_pipeline(commands: Vec<Vec<String>>) -> i32 {
     let mut previous_stdout: Option<ChildStdout> = None;
     let mut children = Vec::new();
 
-    for (idx, argv) in commands.into_iter().enumerate() {
-        let mut argv_exec = argv.clone();
-        if let Some(p) = resolve_command_path(&argv_exec[0]) {
-            argv_exec[0] = p;
+    for (idx, mut cmd_info) in commands.into_iter().enumerate() {
+        if cmd_info.args.is_empty() {
+            eprintln!("エラー: パイプラインに空のコマンドが含まれています。");
+            return 1;
         }
 
-        let mut cmd = Command::new(&argv_exec[0]);
-        cmd.args(&argv_exec[1..]);
+        if let Some(p) = resolve_command_path(&cmd_info.args[0]) {
+            cmd_info.args[0] = p;
+        }
+
+        let mut cmd = Command::new(&cmd_info.args[0]);
+        cmd.args(&cmd_info.args[1..]);
 
         if let Some(stdin_pipe) = previous_stdout.take() {
             cmd.stdin(Stdio::from(stdin_pipe));
+        } else if let Some(path) = cmd_info.stdin_path {
+            match File::open(&path) {
+                Ok(file) => {
+                    cmd.stdin(Stdio::from(file));
+                }
+                Err(e) => {
+                    eprintln!("入力ファイル '{}' を開けませんでした: {}", path.display(), e);
+                    return 1;
+                }
+            }
         } else {
             cmd.stdin(Stdio::inherit());
         }
 
         if idx == last_idx {
-            cmd.stdout(Stdio::inherit());
+            if let Some((path, append)) = cmd_info.stdout_path {
+                match fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(!append)
+                    .append(append)
+                    .open(&path)
+                {
+                    Ok(file) => {
+                        cmd.stdout(Stdio::from(file));
+                    }
+                    Err(e) => {
+                        eprintln!("出力ファイル '{}' を開けませんでした: {}", path.display(), e);
+                        return 1;
+                    }
+                }
+            } else {
+                cmd.stdout(Stdio::inherit());
+            }
         } else {
+            if cmd_info.stdout_path.is_some() {
+                eprintln!("エラー: 出力リダイレクションはパイプラインの最後のコマンドでのみ許可されています。");
+                return 1;
+            }
             cmd.stdout(Stdio::piped());
         }
 
-        cmd.stderr(Stdio::inherit());
+        if let Some(path) = cmd_info.stderr_path {
+            match fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&path)
+            {
+                Ok(file) => {
+                    cmd.stderr(Stdio::from(file));
+                }
+                Err(e) => {
+                    eprintln!("エラー出力ファイル '{}' を開けませんでした: {}", path.display(), e);
+                    return 1;
+                }
+            }
+        } else {
+            cmd.stderr(Stdio::inherit());
+        }
 
         match cmd.spawn() {
             Ok(mut child) => {
-                previous_stdout = child.stdout.take();
+                previous_stdout = if idx != last_idx {
+                    child.stdout.take()
+                } else {
+                    None
+                };
                 children.push(child);
             }
             Err(e) => {
-                eprintln!("コマンド実行失敗: {}: {}", argv_exec[0], e);
+                eprintln!("コマンド実行失敗: {}: {}", cmd_info.args[0], e);
                 return 1;
             }
         }
@@ -347,7 +449,6 @@ fn run_pipeline(commands: Vec<Vec<String>>) -> i32 {
     }
     last_status
 }
-
 
 fn resolve_command_path(cmd: &str) -> Option<String> {
     if cmd.contains('/') {
@@ -366,25 +467,8 @@ fn resolve_command_path(cmd: &str) -> Option<String> {
     None
 }
 
-fn try_builtin(argv: &[String]) -> bool {
+fn try_builtin_special(argv: &[String]) -> bool {
     match argv.first().map(String::as_str) {
-        Some("echo") => {
-            println!("{}", argv[1..].join(" "));
-            true
-        }
-        Some("ls") => {
-            let path = argv.get(1).map(String::as_str).unwrap_or(".");
-            match std::fs::read_dir(path) {
-                Ok(entries) => {
-                    for entry in entries.filter_map(Result::ok) {
-                        print!("{}  ", entry.file_name().to_string_lossy());
-                    }
-                    println!();
-                }
-                Err(e) => eprintln!("ls: {e}"),
-            }
-            true
-        }
         Some("cd") => {
             if let Some(path) = argv.get(1).map(String::as_str) {
                 if let Err(e) = env::set_current_dir(path) {
@@ -401,57 +485,11 @@ fn try_builtin(argv: &[String]) -> bool {
             }
             true
         }
-        Some("pwd") => {
-            if let Ok(path) = env::current_dir() {
-                println!("{}", path.display());
-            } else {
-                eprintln!("pwd: (カレントディレクトリが分から)ないです");
-            }
-            true
-        }
         Some("exit") | Some("quit") => {
             let code = argv.get(1).and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
             std::process::exit(code);
         }
         _ => false,
-    }
-}
-
-fn run_external(argv: &[String]) -> i32 {
-    if argv.is_empty() {
-        return 0;
-    }
-    let status = Command::new(&argv[0])
-        .args(&argv[1..])
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status();
-    match status {
-        Ok(s) => match s.code() {
-            Some(0) => 0,
-            Some(1) => {
-                eprintln!("またのぅ～ (Exit: 1)");
-                1
-            }
-            Some(code) => {
-                eprintln!("ファッ！？ｳｰﾝ…: （コード{code}）");
-                code
-            }
-            None => {
-                eprintln!("んにゃぴ・・・");
-                1
-            }
-        },
-        Err(e) => {
-            match e.raw_os_error() {
-                Some(2) => eprintln!("知らねーよ、そんなの"),
-                Some(13) => eprintln!("駄目です（権限なし）"),
-                Some(code) => eprintln!("これもうわかんねぇな… {code}: {e}"),
-                None => eprintln!("よくわかんなかったです(OSエラー): {e}"),
-            }
-            1
-        }
     }
 }
 
@@ -472,42 +510,83 @@ fn parse_line(input: &str) -> Result<Vec<String>, String> {
             State::Normal => match c {
                 ' ' | '\t' | '\n' => {
                     if !current.is_empty() {
-                        tokens.push(current.trim().to_string());
-                        current.clear();
+                        tokens.push(std::mem::take(&mut current));
                     }
                 }
-                '\'' => state = State::Single,
-                '"'  => state = State::Double,
-                '\\' => {
-                    if let Some(n) = chars.next() {
-                        current.push(n);
+                '\'' => {
+                    if !current.is_empty() {
+                        tokens.push(std::mem::take(&mut current));
                     }
-                }
-                '$'  => current.push_str(&expand_var(&mut chars)),
-                _    => current.push(c),
-            },
-            State::Single => {
-                if c == '\'' {
-                    state = State::Normal;
-                } else {
+                    state = State::Single;
                     current.push(c);
                 }
-            }
-            State::Double => match c {
-                '"'  => state = State::Normal,
+                '"' => {
+                    if !current.is_empty() {
+                        tokens.push(std::mem::take(&mut current));
+                    }
+                    state = State::Double;
+                    current.push(c);
+                }
                 '\\' => {
                     if let Some(n) = chars.next() {
                         current.push(n);
                     }
                 }
-                '$'  => current.push_str(&expand_var(&mut chars)),
-                _    => current.push(c),
+                '$' => current.push_str(&expand_var(&mut chars)),
+                '|' | '<' => {
+                    if !current.is_empty() {
+                        tokens.push(std::mem::take(&mut current));
+                    }
+                    tokens.push(c.to_string());
+                }
+                '>' => {
+                    if !current.is_empty() {
+                        tokens.push(std::mem::take(&mut current));
+                    }
+                    if chars.peek() == Some(&'>') {
+                        chars.next();
+                        tokens.push(">>".to_string());
+                    } else {
+                        tokens.push(">".to_string());
+                    }
+                }
+                '2' if chars.peek() == Some(&'>') => {
+                    if !current.is_empty() {
+                        tokens.push(std::mem::take(&mut current));
+                    }
+                    chars.next(); // consume '>'
+                    tokens.push("2>".to_string());
+                }
+                _ => current.push(c),
             },
+            State::Single => {
+                current.push(c);
+                if c == '\'' {
+                    tokens.push(std::mem::take(&mut current));
+                    state = State::Normal;
+                }
+            }
+            State::Double => {
+                match c {
+                    '\\' => {
+                        if let Some(n) = chars.next() {
+                           current.push(n);
+                        }
+                    },
+                    '$' => current.push_str(&expand_var(&mut chars)),
+                    '"' => {
+                        current.push(c);
+                        tokens.push(std::mem::take(&mut current));
+                        state = State::Normal;
+                    }
+                    _ => current.push(c),
+                }
+            }
         }
-    } 
+    }
 
     if !current.is_empty() {
-        tokens.push(current.trim().to_string());
+        tokens.push(std::mem::take(&mut current));
     }
 
     let home = env::var("HOME").unwrap_or_default();
@@ -519,6 +598,7 @@ fn parse_line(input: &str) -> Result<Vec<String>, String> {
     }
     Ok(tokens)
 }
+
 
 fn main() -> rustyline::Result<()> {
     let config: Config = ConfigBuilder::new()
@@ -544,7 +624,6 @@ fn main() -> rustyline::Result<()> {
 
     loop {
         let mut full_input = String::new();
-        // build_prompt(last_status)
         let mut prompt = build_prompt();
 
         loop {
@@ -608,19 +687,29 @@ fn main() -> rustyline::Result<()> {
         match parse_line(trimmed) {
             Ok(tokens) if tokens.is_empty() => continue,
             Ok(tokens) => {
-                let pipeline = split_by_pipe(&tokens);
-
-                if pipeline.len() > 1 {
-                    last_status = run_pipeline(pipeline);
+                let first_cmd = tokens.first().map(String::as_str).unwrap_or("");
+                if first_cmd == "cd" || first_cmd == "exit" || first_cmd == "quit" {
+                    if tokens.contains(&"|".to_string()) {
+                        eprintln!("エラー: '{}' はパイプラインでは使用できません。", first_cmd);
+                        last_status = 1;
+                        continue;
+                    }
+                    if tokens.iter().any(|t| t == ">" || t == ">>" || t == "<" || t == "2>") {
+                        eprintln!("エラー: '{}' はリダイレクションをサポートしていません。", first_cmd);
+                        last_status = 1;
+                        continue;
+                    }
+                    try_builtin_special(&tokens);
+                    last_status = 0;
                 } else {
-                    let mut argv_exec = tokens.clone();
-                    if let Some(p) = resolve_command_path(&argv_exec[0]) {
-                        argv_exec[0] = p;
-                        last_status = run_external(&argv_exec);
-                    } else if try_builtin(&tokens) {
-                        last_status = 0;
-                    } else {
-                        last_status = run_external(&argv_exec);
+                    match parse_commands(&tokens) {
+                        Ok(pipeline) => {
+                            last_status = run_pipeline(pipeline);
+                        }
+                        Err(e) => {
+                            eprintln!("エラー: {}", e);
+                            last_status = 1;
+                        }
                     }
                 }
             }
