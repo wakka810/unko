@@ -4,10 +4,16 @@ use std::{
     env,
     fs::{self, File},
     path::{Path, PathBuf},
+    io::Read,
     process::{ChildStdout, Command, Stdio},
 };
 
 use ansi_term::Colour::{Blue, Fixed, Green, Purple, Yellow};
+use std::ffi::CString;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::io::FromRawFd;
+use std::time::{SystemTime, UNIX_EPOCH};
+use libc::{self, F_GETFL, F_SETFL, O_NONBLOCK, O_RDONLY, O_WRONLY};
 use git2::Repository;
 use once_cell::sync::Lazy;
 use rayon::prelude::*;
@@ -283,6 +289,63 @@ fn expand_var<I: Iterator<Item = char>>(iter: &mut std::iter::Peekable<I>) -> St
     }
 }
 
+fn mkfifo_temp() -> PathBuf {
+    let mut path = std::env::temp_dir();
+    let uniq = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    path.push(format!("unko_ps_{}", uniq));
+    let cstr = CString::new(path.as_os_str().as_bytes()).unwrap();
+    unsafe {
+        if libc::mkfifo(cstr.as_ptr(), 0o600) != 0 {
+            panic!("mkfifo 失敗");
+        }
+    }
+    path
+}
+
+fn spawn_process_sub(
+    cmd_str: &str,
+    fifo_path: &Path,
+    is_output_sub: bool,
+    children: &mut Vec<std::process::Child>,
+) {
+    let exe = env::current_exe()
+        .unwrap_or_else(|_| PathBuf::from(env::args().next().unwrap_or_default()));
+    let mut child_cmd = Command::new(exe);
+    child_cmd.arg("-c").arg(cmd_str);
+
+    unsafe {
+        let c_path = CString::new(fifo_path.as_os_str().as_bytes()).unwrap();
+        if is_output_sub {
+            let fd = libc::open(c_path.as_ptr(), O_RDONLY | O_NONBLOCK);
+            if fd >= 0 {
+                let flags = libc::fcntl(fd, F_GETFL);
+                if flags >= 0 {
+                    libc::fcntl(fd, F_SETFL, flags & !O_NONBLOCK);
+                }
+                let f = File::from_raw_fd(fd);
+                child_cmd.stdin(Stdio::from(f));
+            }
+            child_cmd.stdout(Stdio::inherit());
+        } else {
+            let fd = libc::open(c_path.as_ptr(), O_WRONLY | O_NONBLOCK);
+            if fd >= 0 {
+                let f = File::from_raw_fd(fd);
+                child_cmd.stdout(Stdio::from(f));
+            }
+            child_cmd.stdin(Stdio::inherit());
+        }
+        child_cmd.stderr(Stdio::inherit());
+    }
+
+    if let Ok(c) = child_cmd.spawn() {
+        children.push(c);
+    }
+}
+// --------------------------------------------------
+
 fn parse_commands(tokens: &[String]) -> Result<Vec<CommandInfo>, String> {
     let mut commands = Vec::new();
     if tokens.is_empty() {
@@ -292,6 +355,18 @@ fn parse_commands(tokens: &[String]) -> Result<Vec<CommandInfo>, String> {
     for group in tokens.split(|token| token == "|") {
         if group.is_empty() {
             return Err("構文エラー: パイプの前後にはコマンドが必要です。".to_string());
+        }
+
+        if group.first().map(|s| s.as_str()) == Some("(")
+            && group.last().map(|s| s.as_str()) == Some(")")
+        {
+            let inner = group[1..group.len() - 1].join(" ");
+            let exe = env::current_exe()
+                .unwrap_or_else(|_| PathBuf::from(env::args().next().unwrap_or_default()));
+            let mut cmd_info = CommandInfo::default();
+            cmd_info.args = vec![exe.to_string_lossy().into_owned(), "-c".to_string(), inner];
+            commands.push(cmd_info);
+            continue;
         }
 
         let mut cmd_info = CommandInfo::default();
@@ -358,8 +433,61 @@ fn run_pipeline(commands: Vec<CommandInfo>) -> i32 {
             cmd_info.args[0] = p;
         }
 
-        let mut cmd = Command::new(&cmd_info.args[0]);
-        cmd.args(&cmd_info.args[1..]);
+        let mut expanded_args: Vec<String> = if cmd_info
+            .args
+            .get(1)
+            .map(|s| s == "-c")
+            .unwrap_or(false)
+        {
+            cmd_info
+                .args
+                .iter()
+                .enumerate()
+                .map(|(i, a)| if i <= 1 { expand_vars(a) } else { a.clone() })
+                .collect()
+        } else {
+            cmd_info.args.iter().map(|a| expand_vars(a)).collect()
+        };
+
+        let mut extra_children = Vec::new();
+        for arg in expanded_args.iter_mut() {
+            if let Some(rest) = arg.strip_prefix(">(").and_then(|s| s.strip_suffix(')')) {
+                let fifo = mkfifo_temp();
+                spawn_process_sub(rest.trim(), &fifo, true, &mut extra_children);
+                *arg = fifo.to_string_lossy().into_owned();
+            } else if let Some(rest) = arg.strip_prefix("<(").and_then(|s| s.strip_suffix(')')) {
+                let fifo = mkfifo_temp();
+                spawn_process_sub(rest.trim(), &fifo, false, &mut extra_children);
+                *arg = fifo.to_string_lossy().into_owned();
+            }
+        }
+        // 追加子プロセスを main の children にマージ
+        children.extend(extra_children);
+        // --------------------------------------
+
+        if expanded_args[0] == "read" {
+            if let Some(var) = expanded_args.get(1) {
+                let mut input = String::new();
+                if let Some(mut stdin_pipe) = previous_stdout.take() {
+                    stdin_pipe.read_to_string(&mut input).ok();
+                } else {
+                    std::io::stdin().read_to_string(&mut input).ok();
+                }
+                if let Some(pos) = input.find('\n') {
+                    input.truncate(pos);
+                }
+                unsafe { env::set_var(var, input.trim_end_matches('\n')); }
+                previous_stdout = None;
+                continue;
+            }
+        }
+
+        if let Some(p) = resolve_command_path(&expanded_args[0]) {
+            expanded_args[0] = p;
+        }
+
+        let mut cmd = Command::new(&expanded_args[0]);
+        cmd.args(&expanded_args[1..]);
 
         if let Some(stdin_pipe) = previous_stdout.take() {
             cmd.stdin(Stdio::from(stdin_pipe));
@@ -434,7 +562,7 @@ fn run_pipeline(commands: Vec<CommandInfo>) -> i32 {
                 children.push(child);
             }
             Err(e) => {
-                eprintln!("コマンド実行失敗: {}: {}", cmd_info.args[0], e);
+                eprintln!("コマンド実行失敗: {}: {}", expanded_args[0], e);
                 return 1;
             }
         }
@@ -513,27 +641,52 @@ fn parse_line(input: &str) -> Result<Vec<String>, String> {
                         tokens.push(std::mem::take(&mut current));
                     }
                 }
+                // --- 修正点 ---
+                // クォート文字を current に追加しない
                 '\'' => {
                     if !current.is_empty() {
                         tokens.push(std::mem::take(&mut current));
                     }
                     state = State::Single;
-                    current.push(c);
                 }
+                // --- 修正点 ---
+                // クォート文字を current に追加しない
                 '"' => {
                     if !current.is_empty() {
                         tokens.push(std::mem::take(&mut current));
                     }
                     state = State::Double;
-                    current.push(c);
                 }
                 '\\' => {
                     if let Some(n) = chars.next() {
                         current.push(n);
                     }
                 }
-                '$' => current.push_str(&expand_var(&mut chars)),
+                '$' => current.push('$'),
+                '>' | '<' if chars.peek() == Some(&'(') => {
+                    let mut token = String::from(c); // '>' もしくは '<'
+                    token.push(chars.next().unwrap()); // '('
+                    let mut depth = 1;
+                    while let Some(ch) = chars.next() {
+                        token.push(ch);
+                        if ch == '(' {
+                            depth += 1;
+                        } else if ch == ')' {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                    }
+                    tokens.push(token);
+                }
                 '|' | '<' => {
+                    if !current.is_empty() {
+                        tokens.push(std::mem::take(&mut current));
+                    }
+                    tokens.push(c.to_string());
+                }
+                '(' | ')' | ';' => {
                     if !current.is_empty() {
                         tokens.push(std::mem::take(&mut current));
                     }
@@ -560,22 +713,28 @@ fn parse_line(input: &str) -> Result<Vec<String>, String> {
                 _ => current.push(c),
             },
             State::Single => {
-                current.push(c);
+                // --- 修正点 ---
+                // 終了クォートを見つけたらトークンを確定し、状態を戻す
+                // 終了クォート自体は含めない
                 if c == '\'' {
                     tokens.push(std::mem::take(&mut current));
                     state = State::Normal;
+                } else {
+                    current.push(c);
                 }
             }
             State::Double => {
                 match c {
                     '\\' => {
                         if let Some(n) = chars.next() {
-                           current.push(n);
+                            current.push(n);
                         }
-                    },
-                    '$' => current.push_str(&expand_var(&mut chars)),
+                    }
+                    '$' => current.push('$'),
+                    // --- 修正点 ---
+                    // 終了クォートを見つけたらトークンを確定し、状態を戻す
+                    // 終了クォート自体は含めない
                     '"' => {
-                        current.push(c);
                         tokens.push(std::mem::take(&mut current));
                         state = State::Normal;
                     }
@@ -583,6 +742,11 @@ fn parse_line(input: &str) -> Result<Vec<String>, String> {
                 }
             }
         }
+    }
+
+    // クォートが閉じられていない場合のエラーハンドリング
+    if !matches!(state, State::Normal) {
+        return Err("構文エラー: クォーテーションが閉じられていません。".to_string());
     }
 
     if !current.is_empty() {
@@ -599,8 +763,52 @@ fn parse_line(input: &str) -> Result<Vec<String>, String> {
     Ok(tokens)
 }
 
+fn expand_vars(input: &str) -> String {
+    let mut out = String::new();
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '$' {
+            if let Some(&'{') = chars.peek() {
+                chars.next();
+                let mut name = String::new();
+                while let Some(&ch) = chars.peek() {
+                    chars.next();
+                    if ch == '}' {
+                        break;
+                    }
+                    name.push(ch);
+                }
+                out.push_str(&env::var(name).unwrap_or_default());
+            } else {
+                let mut name = String::new();
+                while let Some(&ch) = chars.peek() {
+                    if ch.is_alphanumeric() || ch == '_' {
+                        name.push(ch);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                if name.is_empty() {
+                    out.push('$');
+                } else {
+                    out.push_str(&env::var(name).unwrap_or_default());
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
 
 fn main() -> rustyline::Result<()> {
+    let args_vec: Vec<String> = env::args().collect();
+    if args_vec.len() >= 3 && args_vec[1] == "-c" {
+        run_script(&args_vec[2..].join(" "))?;
+        return Ok(());
+    }
+
     let config: Config = ConfigBuilder::new()
         .history_ignore_dups(true)?
         .completion_type(CompletionType::List)
@@ -716,4 +924,33 @@ fn main() -> rustyline::Result<()> {
             Err(e) => eprintln!("{e}"),
         }
     }
+}
+
+fn run_script(script: &str) -> rustyline::Result<()> {
+    for part in script.split(';') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match parse_line(trimmed) {
+            Ok(tokens) if tokens.is_empty() => {}
+            Ok(tokens) => {
+                let first = tokens.first().map(String::as_str).unwrap_or("");
+                if ["cd", "exit", "quit"].contains(&first) {
+                    try_builtin_special(&tokens);
+                } else {
+                    match parse_commands(&tokens) {
+                        Ok(pipeline) => {
+                            run_pipeline(pipeline);
+                        }
+                        Err(e) => {
+                            eprintln!("エラー: {}", e);
+                        }
+                    }
+                }
+            }
+            Err(e) => eprintln!("{e}"),
+        }
+    }
+    Ok(())
 }
